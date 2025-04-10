@@ -1,6 +1,6 @@
-# Sui Gas Pool
+# OneChain Gas Pool
 
-Sui Gas Pool is a service that powers sponsored transactions on Sui at scale. It manages a database of gas coins owned
+OneChain Gas Pool is a service that powers sponsored transactions on OneChain at scale. It manages a database of gas coins owned
 by a sponsor address and provides APIs to reserve gas coins and use them to pay for transactions. It achieves
 scalability and high throughput by managing a large number of gas coin objects in the pool, so that it can sponsor a
 large number of transactions concurrently.
@@ -112,7 +112,7 @@ pub struct ExecuteTxResponse {
 The Gas Pool Initializer is able to initialize the global gas pool, as well as processing new funds and adding new coins
 to the gas pool.
 When we are starting up the gas pool for a given sponsor address for the first time, it will trigger the initialization
-process. It looks at all the SUI coins currently owned by the sponsor address, and split them into gas coins with a
+process. It looks at all the OCT coins currently owned by the sponsor address, and split them into gas coins with a
 specified target balance. Once a day, it also looks at whether there is any coin owned by the sponsor address with a
 very large balance (NEW_COIN_BALANCE_FACTOR_THRESHOLD \* target_init_balance), and if so it triggers initialization
 process again on the newly detected coin. This allows us add funding to the gas pool.
@@ -131,12 +131,12 @@ implementations:
    transactions. We provided a [sample implementation](sample_kms_sidecar/) of such sidecar in the repo.
 2. In-memory: This allows the gas pool server to load a [`SuiKeyPair`](https://github.com/MystenLabs/sui/blob/2873d7a2532343247d545d52bcd9d7ab138096bb/crates/sui-types/src/crypto.rs#L136) directly from file and use it to sign transactions. The config file expects a Base 64 encoded form of `SuiKeyPair`. You can obtain it using one the following ways:
    - Using the `sui` binary to generate a new keypair by running `sui keytool generate ed25519`, and find the serialized keypair in the `<address>.key` file.
-   - If you have already imported your key to your local Sui client config, you can also find the keypair in `~/.sui/sui_config/sui.keystore`.
+   - If you have already imported your key to your local OneChain client config, you can also find the keypair in `~/.sui/sui_config/sui.keystore`.
    - More details of Sui key formats can be found in the [official document](https://docs.sui.io/references/cli/keytool).
 
 ## Binaries
 
-### `sui-gas-station` Binary
+### `gas-station` Binary
 
 The binary takes a an argument:
 
@@ -161,7 +161,7 @@ Below describes the steps to deploy a gas pool service:
    and
    this address cannot be used for any other purpose. Otherwise transactions sent outside of the gas pool could mess up
    the gas coin setup.
-2. Send a sufficiently funded SUI coin into that address. This will be the initial funding of the gas pool.
+2. Send a sufficiently funded OCT coin into that address. This will be the initial funding of the gas pool.
 3. Deploy a Redis instance.
 4. Create a YAML config file (see details below).
 5. Pick a secure secret token for the RPC server, this will be passed through the `GAS_STATION_AUTH` environment
@@ -202,7 +202,7 @@ A description of these fields:
 - fullnode-url: The fullnode that the gas pool will be talking to.
 - coin-init-config
   - target-init-balance: The targeting initial balance of each coin (in MIST). For instance if you specify 100000000
-    which is 0.1 SUI, the gas pool will attempt to split its gas coin into smaller gas coins each with 0.1 SUI balance
+    which is 0.1 OCT, the gas pool will attempt to split its gas coin into smaller gas coins each with 0.1 OCT balance
     during initialization.
   - refresh-interval-sec: The interval to look at all gas coins owned by the sponsor again and see if some new funding
     has been added.
