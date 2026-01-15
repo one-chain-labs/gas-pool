@@ -1,6 +1,6 @@
 # OneChain Gas Pool
 
-OneChain Gas Pool is a service that powers sponsored transactions on OneChain at scale. It manages a database of gas coins owned
+O ne C hai n Gas Pool is a service that powers sponsored transactions on OneChain at scale. It manages a database of gas coins owned
 by a sponsor address and provides APIs to reserve gas coins and use them to pay for transactions. It achieves
 scalability and high throughput by managing a large number of gas coin objects in the pool, so that it can sponsor a
 large number of transactions concurrently.
@@ -39,8 +39,8 @@ components:
 The storage layer stores all the gas coins in the pool and reservation information. It is the only place where we
 persist data.
 It uses Redis store as the backend, and Lua scripts to control the logic.
-Detailed documentation of each Lua script can be found
-in [link](https://www.notion.so/mystenlabs/src/storage/redis/lua_scripts/).
+Detailed documentation of Lua scripts can be found
+in each script file [here](/src/storage/redis/lua_scripts).
 
 ## Gas Pool Server
 
@@ -61,16 +61,15 @@ is also why an internal server is needed such that the barer token is not expose
 An HTTP server is implemented to take the following 3 requests:
 
 - GET("/"): Checks the health of the server
-- POST("/v1/reserve_gas"): Takes a [`ReserveGasRequest`](https://www.notion.so/mystenlabs/src/rpc/rpc_types.rs)
+- POST("/v1/reserve_gas"): Takes a [`ReserveGasRequest`](/src/rpc/rpc_types.rs)
   parameter in JSON form, and
-  returns [`ReserveGasResponse`](https://www.notion.so/mystenlabs/src/rpc/rpc_types.rs).
-- POST("/v1/execute_tx"): Takes a [`ExecuteTxRequest`](https://www.notion.so/mystenlabs/src/rpc/rpc_types.rs) parameter
+  returns [`ReserveGasResponse`](/src/rpc/rpc_types.rs).
+- POST("/v1/execute_tx"): Takes a [`ExecuteTxRequest`](/src/rpc/rpc_types.rs) parameter
   in JSON form, and
-  returns [`ExecuteTxResponse`](https://www.notion.so/mystenlabs/src/rpc/rpc_types.rs).
+  returns [`ExecuteTxResponse`](/src/rpc/rpc_types.rs).
 
 ```rust
 pub struct ReserveGasRequest {
-    pub sponsor_address: Option<SuiAddress>,
     /// Desired gas budget. The response will contain gas coins that have total balance >= gas_budget.
     pub gas_budget: u64,
     /// The reserved gas coins will be released back to the pool after this duration expires.
@@ -93,19 +92,37 @@ pub struct ExecuteTxRequest {
     pub reservation_id: ReservationID,
     /// BCS serialized transaction data bytes without its type tag, as base-64 encoded string.
     pub tx_bytes: Base64,
-    pub request_type: Option<ExecuteTransactionRequestType>,
     /// User signature (`flag || signature || pubkey` bytes, as base-64 encoded string). Signature is committed to the intent message of the transaction data, as base-64 encoded string.
     pub user_sig: Base64,
+    /// Defines the fields the block response returns with.
+    pub options: Option<SuiTransactionBlockResponseOptions>,
 }
 
 pub struct ExecuteTxResponse {
-    pub timestamp_ms: Option<u64>,
+    /// If no options were passed in the `ExecuteTxRequest` this field is populated in the response.
     pub effects: Option<SuiTransactionBlockEffects>,
-    pub events: Option<SuiTransactionBlockEvents>,
+    /// If options were passed in the `ExecuteTxRequest`, even if empty, this field is populated in the response.
+    pub tx_block_response: Option<SuiTransactionBlockResponse>,
     pub error: Option<String>,
 }
 
 ```
+
+#### Options schema:
+
+```TS
+options = {
+   showBalanceChanges?: boolean,
+   showObjectChanges?: boolean,
+   showEffects?: boolean,
+   showRawEffects?: boolean,
+   showInput?: boolean,
+   showRawInput?: boolean,
+   showEvents?: boolean,
+}
+```
+
+Notice that they should be typed in camelCase and not in snake_case in JSON format.
 
 ### Gas Pool Initializer
 
@@ -132,11 +149,11 @@ implementations:
 2. In-memory: This allows the gas pool server to load a [`SuiKeyPair`](https://github.com/MystenLabs/sui/blob/2873d7a2532343247d545d52bcd9d7ab138096bb/crates/sui-types/src/crypto.rs#L136) directly from file and use it to sign transactions. The config file expects a Base 64 encoded form of `SuiKeyPair`. You can obtain it using one the following ways:
    - Using the `sui` binary to generate a new keypair by running `sui keytool generate ed25519`, and find the serialized keypair in the `<address>.key` file.
    - If you have already imported your key to your local OneChain client config, you can also find the keypair in `~/.sui/sui_config/sui.keystore`.
-   - More details of Sui key formats can be found in the [official document](https://docs.sui.io/references/cli/keytool).
+   - More details of OneChain key formats can be found in the [official document](https://docs.sui.io/references/cli/keytool).
 
 ## Binaries
 
-### `gas-station` Binary
+### `sui-gas-station` Binary
 
 The binary takes a an argument:
 
@@ -152,7 +169,21 @@ The `tool` binary currently supports a few helper commands:
 2. `generate-sample-config`: This generates a sample config file that can be used to start the gas station server.
 3. `cli`: Provides a few CLI commands to interact with the gas station server.
 
+## Tests
+
+To run the tests, make sure you have the required setup thats described in the [Deploymen Section](#deployment)
+section.
+
+After that run them with `cargo nextest run -j1`. Tests can't run in parallel due to them connecting to the same redis instance
+
 ## Deployment
+
+### Prerequisites for local development
+
+- [Rust toolchain](https://rust-lang.org/tools/install/)
+- [Redis](https://redis.io/docs/latest/operate/oss_and_stack/install/archive/install-redis/)
+
+### Running the Gas Station
 
 Below describes the steps to deploy a gas pool service:
 
@@ -162,15 +193,17 @@ Below describes the steps to deploy a gas pool service:
    this address cannot be used for any other purpose. Otherwise transactions sent outside of the gas pool could mess up
    the gas coin setup.
 2. Send a sufficiently funded OCT coin into that address. This will be the initial funding of the gas pool.
+   - If you used in-memory signer, you can get the wallet address of the keypair that was generated with the OneChain cli by using the following command: `sui keytool unpack <keypair>`
 3. Deploy a Redis instance.
 4. Create a YAML config file (see details below).
+   - Edit the config's fullnode-url to match with the network you will be working with. If using localnet no need to edit it.
 5. Pick a secure secret token for the RPC server, this will be passed through the `GAS_STATION_AUTH` environment
    variable when starting the gas pool server.
-6. Deploy the gas pool server.
+6. Deploy the gas pool server: `cargo run --bin sui-gas-station -- --config-path sample.yaml`
 
 To create a YAML config file, you can use the following command to generate a sample config:
 
-`tool generate-sample-config --config-path sample.yaml --with-sidecar-signer`
+`cargo run --bin tool generate-sample-config --config-path sample.yaml --with-sidecar-signer`
 
 ```yaml
 ---
@@ -188,6 +221,7 @@ coin-init-config:
   target-init-balance: 100000000
   refresh-interval-sec: 86400
 daily-gas-usage-cap: 1500000000000
+advanced-faucet-mode: false
 ```
 
 If you want to use in-memory signer, you can remove `--with-sidecar-signer` from the command.
@@ -207,3 +241,7 @@ A description of these fields:
   - refresh-interval-sec: The interval to look at all gas coins owned by the sponsor again and see if some new funding
     has been added.
 - daily-gas-usage-cap: The total amount of gas usage allowed per day, as a safety cap.
+- advanced-faucet-mode: This enables the gas pool to be configured to work in a faucet mode, where the sender and the sponsor
+  are the same, and gas coins are allowed to be used in the transaction other than gas payment, i.e. the balance of the gas
+  coin can be transferred away in an arbitrary way. Do not use this unless you know what you are doing as there are risks
+  around the gas pool being depleted!

@@ -7,7 +7,7 @@ use serde_with::serde_as;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use sui_config::Config;
-use sui_types::crypto::{get_account_key_pair, SuiKeyPair};
+use sui_types::crypto::{SuiKeyPair, get_account_key_pair};
 use sui_types::gas_coin::MIST_PER_OCT;
 
 pub const DEFAULT_RPC_PORT: u16 = 9527;
@@ -41,6 +41,10 @@ pub struct GasStationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coin_init_config: Option<CoinInitConfig>,
     pub daily_gas_usage_cap: u64,
+    /// Enables the gas pool to work as a faucet, where the sender is the same as the sponsor.
+    /// Do not set to true unless you have a specific or niche use case and you understand the
+    /// risks associated with this mode.
+    pub advanced_faucet_mode: bool,
 }
 
 impl Config for GasStationConfig {}
@@ -57,6 +61,7 @@ impl Default for GasStationConfig {
             fullnode_basic_auth: None,
             coin_init_config: Some(CoinInitConfig::default()),
             daily_gas_usage_cap: DEFAULT_DAILY_GAS_USAGE_CAP,
+            advanced_faucet_mode: false,
         }
     }
 }
@@ -80,7 +85,7 @@ impl Default for GasPoolStorageConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TxSignerConfig {
-    Local { keypair: Vec<SuiKeyPair> },
+    Local { keypair: SuiKeyPair },
     Sidecar { sidecar_url: String },
 }
 
@@ -88,7 +93,7 @@ impl Default for TxSignerConfig {
     fn default() -> Self {
         let (_, keypair) = get_account_key_pair();
         Self::Local {
-            keypair: vec![keypair.into()],
+            keypair: keypair.into(),
         }
     }
 }

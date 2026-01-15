@@ -12,7 +12,7 @@ use clap::*;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use sui_config::Config;
-use tracing::info;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(
@@ -39,6 +39,7 @@ impl Command {
             metrics_port,
             coin_init_config,
             daily_gas_usage_cap,
+            advanced_faucet_mode,
         } = config;
 
         let metric_address = SocketAddr::new(IpAddr::V4(rpc_host_ip), metrics_port);
@@ -53,9 +54,18 @@ impl Command {
 
         let signer = signer_config.new_signer().await;
         let storage_metrics = StorageMetrics::new(&prometheus_registry);
-        let sponsor_addresses = signer.get_addresses();
-        info!("Sponsor addresses: {:?}", sponsor_addresses);
-        let storage = connect_storage(&gas_pool_config, sponsor_addresses, storage_metrics).await;
+        let sponsor_address = signer.get_address();
+        info!("Sponsor address: {:?}", sponsor_address);
+
+        let storage =
+            match connect_storage(&gas_pool_config, sponsor_address, storage_metrics).await {
+                Ok(storage) => storage,
+                Err(e) => {
+                    error!("Connecting to storage failed with: {e:?}");
+                    std::process::exit(1);
+                }
+            };
+
         let sui_client = SuiClient::new(&fullnode_url, fullnode_basic_auth).await;
         let _coin_init_task = if let Some(coin_init_config) = coin_init_config {
             let task = GasPoolInitializer::start(
@@ -77,6 +87,7 @@ impl Command {
             sui_client,
             daily_gas_usage_cap,
             core_metrics,
+            advanced_faucet_mode,
         )
         .await;
 

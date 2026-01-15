@@ -4,12 +4,11 @@
 mod script_manager;
 
 use crate::metrics::StorageMetrics;
-use crate::storage::redis::script_manager::ScriptManager;
 use crate::storage::Storage;
+use crate::storage::redis::script_manager::ScriptManager;
 use crate::types::{GasCoin, ReservationID};
 use chrono::Utc;
-use redis::aio::ConnectionManager;
-use std::collections::HashMap;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,23 +19,29 @@ use tracing::{debug, info};
 pub struct RedisStorage {
     conn_manager: ConnectionManager,
     // String format of the sponsor address to avoid converting it to string multiple times.
-    sponsor_vec: Vec<String>,
+    sponsor_str: String,
     metrics: Arc<StorageMetrics>,
 }
 
 impl RedisStorage {
     pub async fn new(
         redis_url: &str,
-        sponsor_vec: Vec<SuiAddress>,
+        sponsor_address: SuiAddress,
         metrics: Arc<StorageMetrics>,
-    ) -> Self {
-        let client = redis::Client::open(redis_url).unwrap();
-        let conn_manager = ConnectionManager::new(client).await.unwrap();
-        Self {
+    ) -> anyhow::Result<Self> {
+        let client = redis::Client::open(redis_url)?;
+
+        let conn_config = ConnectionManagerConfig::new()
+            .set_factor(2)
+            .set_number_of_retries(3)
+            .set_max_delay(5000);
+
+        let conn_manager = ConnectionManager::new_with_config(client, conn_config).await?;
+        Ok(Self {
             conn_manager,
-            sponsor_vec: sponsor_vec.into_iter().map(|s| s.to_string()).collect(),
+            sponsor_str: sponsor_address.to_string(),
             metrics,
-        }
+        })
     }
 }
 
@@ -44,12 +49,10 @@ impl RedisStorage {
 impl Storage for RedisStorage {
     async fn reserve_gas_coins(
         &self,
-        sponsor: SuiAddress,
         target_budget: u64,
         reserved_duration_ms: u64,
     ) -> anyhow::Result<(ReservationID, Vec<GasCoin>)> {
         self.metrics.num_reserve_gas_coins_requests.inc();
-        let sponsor_str = sponsor.to_string();
 
         let expiration_time = Utc::now()
             .add(Duration::from_millis(reserved_duration_ms))
@@ -61,7 +64,7 @@ impl Storage for RedisStorage {
             i64,
             i64,
         ) = ScriptManager::reserve_gas_coins_script()
-            .arg(&sponsor_str)
+            .arg(self.sponsor_str.clone())
             .arg(target_budget)
             .arg(expiration_time)
             .invoke_async(&mut conn)
@@ -84,7 +87,6 @@ impl Storage for RedisStorage {
                 let version = SequenceNumber::from(splits.next().unwrap().parse::<u64>().unwrap());
                 let digest = ObjectDigest::from_str(splits.next().unwrap()).unwrap();
                 GasCoin {
-                    owner: sponsor,
                     balance,
                     object_ref: (object_id, version, digest),
                 }
@@ -93,28 +95,24 @@ impl Storage for RedisStorage {
 
         self.metrics
             .gas_pool_available_gas_coin_count
-            .with_label_values(&[&sponsor_str])
+            .with_label_values(&[&self.sponsor_str])
             .set(new_coin_count);
         self.metrics
             .gas_pool_available_gas_total_balance
-            .with_label_values(&[&sponsor_str])
+            .with_label_values(&[&self.sponsor_str])
             .set(new_total_balance);
         self.metrics.num_successful_reserve_gas_coins_requests.inc();
         Ok((reservation_id, gas_coins))
     }
 
-    async fn ready_for_execution(
-        &self,
-        sponsor: SuiAddress,
-        reservation_id: ReservationID,
-    ) -> anyhow::Result<()> {
+    async fn ready_for_execution(&self, reservation_id: ReservationID) -> anyhow::Result<()> {
         self.metrics.num_ready_for_execution_requests.inc();
 
         let mut conn = self.conn_manager.clone();
         ScriptManager::ready_for_execution_script()
-            .arg(sponsor.to_string())
+            .arg(self.sponsor_str.clone())
             .arg(reservation_id)
-            .invoke_async::<_, ()>(&mut conn)
+            .invoke_async::<()>(&mut conn)
             .await?;
 
         self.metrics
@@ -124,46 +122,43 @@ impl Storage for RedisStorage {
     }
 
     async fn add_new_coins(&self, new_coins: Vec<GasCoin>) -> anyhow::Result<()> {
-        if new_coins.is_empty() {
-            return Ok(());
-        }
         self.metrics.num_add_new_coins_requests.inc();
-        let mut formatted_coin_maps = HashMap::new();
-        for c in new_coins {
-            formatted_coin_maps
-                .entry(c.owner)
-                .or_insert_with(Vec::new)
-                .push(format!(
+        let formatted_coins = new_coins
+            .iter()
+            .map(|c| {
+                // The format is: balance,object_id,version,digest
+                // The way we turn them into strings must be consistent with the way we parse them in
+                // reserve_gas_coins_script.
+                format!(
                     "{},{},{},{}",
                     c.balance,
                     c.object_ref.0,
                     c.object_ref.1.value(),
                     c.object_ref.2
-                ))
-        }
+                )
+            })
+            .collect::<Vec<String>>();
+
         let mut conn = self.conn_manager.clone();
-        let results: String = ScriptManager::add_new_coins_script()
-            .arg(serde_json::to_string(&formatted_coin_maps)?)
+        let (new_total_balance, new_coin_count): (i64, i64) = ScriptManager::add_new_coins_script()
+            .arg(self.sponsor_str.clone())
+            .arg(serde_json::to_string(&formatted_coins)?)
             .invoke_async(&mut conn)
             .await?;
 
-        let results = serde_json::from_str::<Vec<(String, i64, i64)>>(&results)?;
-
-        for (sponsor, new_total_balance, new_coin_count) in results {
-            debug!(
-                "After add_new_coins. New total balance: {}, new coin count: {}",
-                new_total_balance, new_coin_count
-            );
-            self.metrics
-                .gas_pool_available_gas_coin_count
-                .with_label_values(&[&sponsor])
-                .set(new_coin_count as i64);
-            self.metrics
-                .gas_pool_available_gas_total_balance
-                .with_label_values(&[&sponsor])
-                .set(new_total_balance as i64);
-            self.metrics.num_successful_add_new_coins_requests.inc();
-        }
+        debug!(
+            "After add_new_coins. New total balance: {}, new coin count: {}",
+            new_total_balance, new_coin_count
+        );
+        self.metrics
+            .gas_pool_available_gas_coin_count
+            .with_label_values(&[&self.sponsor_str])
+            .set(new_coin_count);
+        self.metrics
+            .gas_pool_available_gas_total_balance
+            .with_label_values(&[&self.sponsor_str])
+            .set(new_total_balance);
+        self.metrics.num_successful_add_new_coins_requests.inc();
         Ok(())
     }
 
@@ -173,7 +168,7 @@ impl Storage for RedisStorage {
         let now = Utc::now().timestamp_millis() as u64;
         let mut conn = self.conn_manager.clone();
         let expired_coin_strings: Vec<String> = ScriptManager::expire_coins_script()
-            .arg(serde_json::to_string(&self.sponsor_vec)?)
+            .arg(self.sponsor_str.clone())
             .arg(now)
             .invoke_async(&mut conn)
             .await?;
@@ -187,78 +182,71 @@ impl Storage for RedisStorage {
         Ok(expired_coin_ids)
     }
 
-    async fn init_coin_stats_at_startup(&self) -> anyhow::Result<Vec<(String, i64, i64)>> {
+    async fn init_coin_stats_at_startup(&self) -> anyhow::Result<(u64, u64)> {
         let mut conn = self.conn_manager.clone();
-        let results: String = ScriptManager::init_coin_stats_at_startup_script()
-            .arg(serde_json::to_string(&self.sponsor_vec)?)
-            .invoke_async(&mut conn)
-            .await?;
-
-        let results = serde_json::from_str::<Vec<(String, i64, i64)>>(&results)?;
-
-        for (sponsor, available_coin_count, available_coin_total_balance) in results.clone() {
-            info!(
-                sponsor_address=?sponsor,
-                "Number of available gas coins in the pool: {}, total balance: {}",
-                available_coin_count,
-                available_coin_total_balance
-            );
-            self.metrics
-                .gas_pool_available_gas_coin_count
-                .with_label_values(&[&sponsor])
-                .set(available_coin_count);
-            self.metrics
-                .gas_pool_available_gas_total_balance
-                .with_label_values(&[&sponsor])
-                .set(available_coin_total_balance);
-        }
-        Ok(results)
+        let (available_coin_count, available_coin_total_balance): (i64, i64) =
+            ScriptManager::init_coin_stats_at_startup_script()
+                .arg(self.sponsor_str.clone())
+                .invoke_async(&mut conn)
+                .await?;
+        info!(
+            sponsor_address=?self.sponsor_str,
+            "Number of available gas coins in the pool: {}, total balance: {}",
+            available_coin_count,
+            available_coin_total_balance
+        );
+        self.metrics
+            .gas_pool_available_gas_coin_count
+            .with_label_values(&[&self.sponsor_str])
+            .set(available_coin_count);
+        self.metrics
+            .gas_pool_available_gas_total_balance
+            .with_label_values(&[&self.sponsor_str])
+            .set(available_coin_total_balance);
+        Ok((
+            available_coin_count as u64,
+            available_coin_total_balance as u64,
+        ))
     }
 
     async fn is_initialized(&self) -> anyhow::Result<bool> {
         let mut conn = self.conn_manager.clone();
         let result = ScriptManager::get_is_initialized_script()
-            .arg(serde_json::to_string(&self.sponsor_vec)?)
-            .invoke_async::<_, bool>(&mut conn)
+            .arg(self.sponsor_str.clone())
+            .invoke_async::<bool>(&mut conn)
             .await?;
         Ok(result)
     }
 
-    async fn acquire_init_lock(
-        &self,
-        lock_duration_sec: u64,
-    ) -> anyhow::Result<Vec<(String, bool)>> {
+    async fn acquire_init_lock(&self, lock_duration_sec: u64) -> anyhow::Result<bool> {
         let mut conn = self.conn_manager.clone();
         let cur_timestamp = Utc::now().timestamp() as u64;
         debug!(
             "Acquiring init lock at {} for {} seconds",
             cur_timestamp, lock_duration_sec
         );
-        let results: String = ScriptManager::acquire_init_lock_script()
-            .arg(serde_json::to_string(&self.sponsor_vec)?)
+        let result = ScriptManager::acquire_init_lock_script()
+            .arg(self.sponsor_str.clone())
             .arg(cur_timestamp)
             .arg(lock_duration_sec)
-            .invoke_async(&mut conn)
+            .invoke_async::<bool>(&mut conn)
             .await?;
-
-        let results = serde_json::from_str::<Vec<(String, bool)>>(&results)?;
-
-        Ok(results)
+        Ok(result)
     }
 
     async fn release_init_lock(&self) -> anyhow::Result<()> {
         debug!("Releasing the init lock.");
         let mut conn = self.conn_manager.clone();
         ScriptManager::release_init_lock_script()
-            .arg(serde_json::to_string(&self.sponsor_vec)?)
-            .invoke_async::<_, ()>(&mut conn)
+            .arg(self.sponsor_str.clone())
+            .invoke_async::<()>(&mut conn)
             .await?;
         Ok(())
     }
 
     async fn check_health(&self) -> anyhow::Result<()> {
         let mut conn = self.conn_manager.clone();
-        redis::cmd("PING").query_async(&mut conn).await?;
+        redis::cmd("PING").query_async::<String>(&mut conn).await?;
         Ok(())
     }
 
@@ -266,35 +254,35 @@ impl Storage for RedisStorage {
     async fn flush_db(&self) {
         let mut conn = self.conn_manager.clone();
         redis::cmd("FLUSHDB")
-            .query_async::<_, String>(&mut conn)
+            .query_async::<String>(&mut conn)
             .await
             .unwrap();
     }
 
-    async fn get_available_coin_count(&self, sponsor: SuiAddress) -> anyhow::Result<usize> {
+    async fn get_available_coin_count(&self) -> anyhow::Result<usize> {
         let mut conn = self.conn_manager.clone();
         let count = ScriptManager::get_available_coin_count_script()
-            .arg(sponsor.to_string())
-            .invoke_async::<_, usize>(&mut conn)
+            .arg(self.sponsor_str.clone())
+            .invoke_async::<usize>(&mut conn)
             .await?;
         Ok(count)
     }
 
-    async fn get_available_coin_total_balance(&self, sponsor: SuiAddress) -> u64 {
+    async fn get_available_coin_total_balance(&self) -> u64 {
         let mut conn = self.conn_manager.clone();
         ScriptManager::get_available_coin_total_balance_script()
-            .arg(sponsor.to_string())
-            .invoke_async::<_, u64>(&mut conn)
+            .arg(self.sponsor_str.clone())
+            .invoke_async::<u64>(&mut conn)
             .await
             .unwrap()
     }
 
     #[cfg(test)]
-    async fn get_reserved_coin_count(&self, sponsor: SuiAddress) -> usize {
+    async fn get_reserved_coin_count(&self) -> usize {
         let mut conn = self.conn_manager.clone();
         ScriptManager::get_reserved_coin_count_script()
-            .arg(sponsor.to_string())
-            .invoke_async::<_, usize>(&mut conn)
+            .arg(self.sponsor_str.clone())
+            .invoke_async::<usize>(&mut conn)
             .await
             .unwrap()
     }
@@ -302,94 +290,111 @@ impl Storage for RedisStorage {
 
 #[cfg(test)]
 mod tests {
-    use sui_types::base_types::{random_object_ref, SuiAddress};
+    use sui_types::base_types::{SuiAddress, random_object_ref};
 
     use crate::{
         metrics::StorageMetrics,
-        storage::{redis::RedisStorage, Storage},
+        storage::{Storage, redis::RedisStorage},
         types::GasCoin,
     };
 
     #[tokio::test]
+    async fn test_malformed_redis_url() {
+        let storage = setup_storage(Some("redi://127.0.0.1:6379")).await;
+        assert!(storage.is_err());
+        assert!(
+            storage
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Redis URL did not parse")
+        )
+    }
+
+    #[tokio::test]
+    async fn test_connection_timeout() {
+        let storage = setup_storage(Some("redis://127.0.0.1:6400")).await;
+        assert!(storage.is_err());
+        assert!(
+            storage
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Connection refused")
+        )
+    }
+
+    #[tokio::test]
     async fn test_init_coin_stats_at_startup() {
-        let storage = setup_storage().await;
+        let storage = setup_storage(None).await.unwrap();
         storage
             .add_new_coins(vec![
                 GasCoin {
-                    owner: SuiAddress::ZERO,
                     balance: 100,
                     object_ref: random_object_ref(),
                 },
                 GasCoin {
-                    owner: SuiAddress::ZERO,
                     balance: 200,
                     object_ref: random_object_ref(),
                 },
             ])
             .await
             .unwrap();
-        let results = storage.init_coin_stats_at_startup().await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, 2);
-        assert_eq!(results[0].2, 300);
+        let (coin_count, total_balance) = storage.init_coin_stats_at_startup().await.unwrap();
+        assert_eq!(coin_count, 2);
+        assert_eq!(total_balance, 300);
     }
 
     #[tokio::test]
     async fn test_add_new_coins() {
-        let storage = setup_storage().await;
-        let sponsor = SuiAddress::ZERO;
+        let storage = setup_storage(None).await.unwrap();
         storage
             .add_new_coins(vec![
                 GasCoin {
-                    owner: sponsor,
                     balance: 100,
                     object_ref: random_object_ref(),
                 },
                 GasCoin {
-                    owner: sponsor,
                     balance: 200,
                     object_ref: random_object_ref(),
                 },
             ])
             .await
             .unwrap();
-        let coin_count = storage.get_available_coin_count(sponsor).await.unwrap();
+        let coin_count = storage.get_available_coin_count().await.unwrap();
         assert_eq!(coin_count, 2);
-        let total_balance = storage.get_available_coin_total_balance(sponsor).await;
+        let total_balance = storage.get_available_coin_total_balance().await;
         assert_eq!(total_balance, 300);
         storage
             .add_new_coins(vec![
                 GasCoin {
-                    owner: sponsor,
                     balance: 300,
                     object_ref: random_object_ref(),
                 },
                 GasCoin {
-                    owner: sponsor,
                     balance: 400,
                     object_ref: random_object_ref(),
                 },
             ])
             .await
             .unwrap();
-        let coin_count = storage.get_available_coin_count(sponsor).await.unwrap();
+        let coin_count = storage.get_available_coin_count().await.unwrap();
         assert_eq!(coin_count, 4);
-        let total_balance = storage.get_available_coin_total_balance(sponsor).await;
+        let total_balance = storage.get_available_coin_total_balance().await;
         assert_eq!(total_balance, 1000);
     }
 
-    async fn setup_storage() -> RedisStorage {
+    async fn setup_storage(redis_url: Option<&str>) -> anyhow::Result<RedisStorage> {
         let storage = RedisStorage::new(
-            "redis://127.0.0.1:6379",
-            vec![SuiAddress::ZERO],
+            redis_url.unwrap_or_else(|| "redis://127.0.0.1:6379"),
+            SuiAddress::ZERO,
             StorageMetrics::new_for_testing(),
         )
-        .await;
+        .await?;
         storage.flush_db().await;
-        let results = storage.init_coin_stats_at_startup().await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, 0);
-        assert_eq!(results[0].2, 0);
-        storage
+        let (coin_count, total_balance) = storage.init_coin_stats_at_startup().await.unwrap();
+        assert_eq!(coin_count, 0);
+        assert_eq!(total_balance, 0);
+        Ok(storage)
     }
 }

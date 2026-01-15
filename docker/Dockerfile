@@ -1,4 +1,4 @@
-FROM rust:1.81-bullseye AS chef
+FROM rust:1.90-bullseye AS chef
 WORKDIR sui
 ARG GIT_REVISION
 ENV GIT_REVISION=$GIT_REVISION
@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y cmake clang
 FROM chef AS builder
 WORKDIR /
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY src ./src
 RUN cargo build --release
 

@@ -7,24 +7,20 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use shared_crypto::intent::{Intent, IntentMessage};
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use sui_types::base_types::SuiAddress;
 use sui_types::crypto::{Signature, SuiKeyPair};
 use sui_types::signature::GenericSignature;
-use sui_types::transaction::{TransactionData, TransactionDataAPI};
+use sui_types::transaction::TransactionData;
 
 #[async_trait::async_trait]
 pub trait TxSigner: Send + Sync {
     async fn sign_transaction(&self, tx_data: &TransactionData)
-        -> anyhow::Result<GenericSignature>;
-    fn get_addresses(&self) -> Vec<SuiAddress>;
+    -> anyhow::Result<GenericSignature>;
+    fn get_address(&self) -> SuiAddress;
     fn is_valid_address(&self, address: &SuiAddress) -> bool {
-        self.get_addresses()
-            .iter()
-            .find(|&&a| a == *address)
-            .is_some()
+        self.get_address() == *address
     }
 }
 
@@ -87,23 +83,18 @@ impl TxSigner for SidecarTxSigner {
         Ok(sig)
     }
 
-    fn get_addresses(&self) -> Vec<SuiAddress> {
-        vec![self.sui_address]
+    fn get_address(&self) -> SuiAddress {
+        self.sui_address
     }
 }
 
 pub struct TestTxSigner {
-    keypair_map: HashMap<SuiAddress, SuiKeyPair>,
+    keypair: SuiKeyPair,
 }
 
 impl TestTxSigner {
-    pub fn new(keypair: Vec<SuiKeyPair>) -> Arc<Self> {
-        Arc::new(Self {
-            keypair_map: keypair
-                .into_iter()
-                .map(|k| ((&k.public()).into(), k))
-                .collect(),
-        })
+    pub fn new(keypair: SuiKeyPair) -> Arc<Self> {
+        Arc::new(Self { keypair })
     }
 }
 
@@ -113,17 +104,12 @@ impl TxSigner for TestTxSigner {
         &self,
         tx_data: &TransactionData,
     ) -> anyhow::Result<GenericSignature> {
-        let gas_owner = tx_data.gas_owner();
-        let keypair = self
-            .keypair_map
-            .get(&gas_owner)
-            .ok_or(anyhow!("Not found ${} keypair", gas_owner))?;
         let intent_msg = IntentMessage::new(Intent::sui_transaction(), tx_data);
-        let sponsor_sig = Signature::new_secure(&intent_msg, keypair).into();
+        let sponsor_sig = Signature::new_secure(&intent_msg, &self.keypair).into();
         Ok(sponsor_sig)
     }
 
-    fn get_addresses(&self) -> Vec<SuiAddress> {
-        self.keypair_map.keys().cloned().collect()
+    fn get_address(&self) -> SuiAddress {
+        (&self.keypair.public()).into()
     }
 }

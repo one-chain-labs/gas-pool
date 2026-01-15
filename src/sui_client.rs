@@ -1,28 +1,29 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::object_locks::MultiGetObjectOwners;
 use crate::types::GasCoin;
 use crate::{retry_forever, retry_with_max_attempts};
-use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::time::Duration;
 use sui_json_rpc_types::{
-    SuiData, SuiObjectDataOptions, SuiObjectResponse, SuiTransactionBlockEffects,
-    SuiTransactionBlockResponseOptions,
+    SuiData, SuiObjectDataOptions, SuiObjectResponse, SuiTransactionBlockResponseOptions,
 };
-use sui_json_rpc_types::{SuiTransactionBlockEffectsAPI, SuiTransactionBlockEvents};
+use sui_json_rpc_types::{SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponse};
 use sui_sdk::SuiClientBuilder;
+use sui_types::SUI_FRAMEWORK_PACKAGE_ID;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::coin::{PAY_MODULE_NAME, PAY_SPLIT_N_FUNC_NAME};
 use sui_types::gas_coin::GAS;
+use sui_types::object::Owner;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 use sui_types::transaction::{
     Argument, ObjectArg, ProgrammableTransaction, Transaction, TransactionKind,
 };
-use sui_types::SUI_FRAMEWORK_PACKAGE_ID;
 use tap::TapFallible;
 use tracing::{debug, info};
 
@@ -56,7 +57,7 @@ impl SuiClient {
             let page = retry_forever!(async {
                 self.sui_client
                     .coin_read_api()
-                    .get_coins(address, None, cursor, None)
+                    .get_coins(address, None, cursor.clone(), None)
                     .await
                     .tap_err(|err| debug!("Failed to get owned gas coins: {:?}", err))
             })
@@ -64,7 +65,6 @@ impl SuiClient {
             for coin in page.data {
                 if coin.balance >= balance_threshold {
                     coins.push(GasCoin {
-                        owner: address,
                         object_ref: coin.object_ref(),
                         balance: coin.balance,
                     });
@@ -109,7 +109,7 @@ impl SuiClient {
                             .read_api()
                             .multi_get_object_with_options(
                                 chunk.clone(),
-                                SuiObjectDataOptions::default().with_bcs().with_owner(),
+                                SuiObjectDataOptions::default().with_bcs(),
                             )
                             .await
                             .map_err(anyhow::Error::from)?;
@@ -202,15 +202,10 @@ impl SuiClient {
     pub async fn execute_transaction(
         &self,
         tx: Transaction,
-        request_type: Option<ExecuteTransactionRequestType>,
         max_attempts: usize,
-    ) -> anyhow::Result<(
-        Option<u64>,
-        SuiTransactionBlockEffects,
-        Option<SuiTransactionBlockEvents>,
-    )> {
+        options: SuiTransactionBlockResponseOptions,
+    ) -> anyhow::Result<SuiTransactionBlockResponse> {
         let digest = *tx.digest();
-        let request_type = request_type.or(Some(ExecuteTransactionRequestType::WaitForEffectsCert));
         debug!(?digest, "Executing transaction: {:?}", tx);
         let response = retry_with_max_attempts!(
             async {
@@ -218,20 +213,27 @@ impl SuiClient {
                     .quorum_driver_api()
                     .execute_transaction_block(
                         tx.clone(),
-                        SuiTransactionBlockResponseOptions::new()
-                            .with_effects()
-                            .with_events(),
-                        request_type.clone(),
+                        options.clone(),
+                        Some(ExecuteTransactionRequestType::WaitForEffectsCert),
                     )
                     .await
                     .tap_err(|err| debug!(?digest, "execute_transaction error: {:?}", err))
                     .map_err(anyhow::Error::from)
             },
             max_attempts
-        )?;
-        let effects = response.effects.ok_or(anyhow::anyhow!("No effects"))?;
-        debug!(?digest, "Transaction execution effects: {:?}", effects);
-        Ok((response.timestamp_ms, effects, response.events))
+        );
+
+        if let Ok(ref response) = response {
+            response
+                .effects
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No effects"))?;
+        } else {
+            return Err(anyhow::Error::from(response.unwrap_err()));
+        };
+
+        debug!(?digest, "Transaction execution response: {:?}", response);
+        response
     }
 
     /// Wait for a known valid object version to be available on the fullnode.
@@ -256,7 +258,6 @@ impl SuiClient {
 
     fn try_get_sui_coin_balance(object: &SuiObjectResponse) -> Option<GasCoin> {
         let data = object.data.as_ref()?;
-        let owner = data.owner.clone()?.get_address_owner_address().ok()?;
         let object_ref = data.object_ref();
         let move_obj = data.bcs.as_ref()?.try_as_move()?;
         if move_obj.type_ != sui_types::gas_coin::GasCoin::type_() {
@@ -264,9 +265,123 @@ impl SuiClient {
         }
         let gas_coin: sui_types::gas_coin::GasCoin = bcs::from_bytes(&move_obj.bcs_bytes).ok()?;
         Some(GasCoin {
-            owner,
             object_ref,
             balance: gas_coin.value(),
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl MultiGetObjectOwners for SuiClient {
+    async fn multi_get_object_owners(
+        &self,
+        object_ids: Vec<ObjectID>,
+    ) -> anyhow::Result<HashMap<ObjectID, (Owner, u64)>> {
+        retry_with_max_attempts!(
+            async {
+                let results = self
+                    .sui_client
+                    .read_api()
+                    .multi_get_object_with_options(
+                        object_ids.clone(),
+                        SuiObjectDataOptions::default().with_owner(),
+                    )
+                    .await
+                    .tap_err(|err| debug!("Failed to get object owners: {:?}", err))?;
+                let mut owner_map = HashMap::new();
+                for r in results {
+                    let Some(data) = &r.data else {
+                        anyhow::bail!("Failed to get object owner: {:?}", r);
+                    };
+                    let Some(owner) = &data.owner else {
+                        anyhow::bail!("Failed to get object owner: {:?}", r);
+                    };
+                    let version = data.version.value();
+                    owner_map.insert(data.object_id, (owner.clone(), version));
+                }
+                Ok(owner_map)
+            },
+            3
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sui_types::crypto::get_account_key_pair;
+    use sui_types::object::Object;
+    use test_cluster::{TestCluster, TestClusterBuilder};
+
+    async fn create_test_cluster(objects: Vec<Object>) -> TestCluster {
+        TestClusterBuilder::new()
+            .with_objects(objects)
+            .build()
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_object_owners() {
+        // Create multiple key pairs to represent different owners
+        let (owner1, _) = get_account_key_pair();
+        let (owner2, _) = get_account_key_pair();
+
+        // Create test objects with different owners
+        let mut objects = vec![];
+
+        // Create object owned by owner1
+        let obj1 = Object::with_owner_for_testing(owner1);
+        objects.push(obj1.clone());
+
+        // Create object owned by owner2
+        let obj2 = Object::with_owner_for_testing(owner2);
+        objects.push(obj2.clone());
+
+        // Create immutable object
+        let obj3 = Object::immutable_for_testing();
+        objects.push(obj3.clone());
+
+        // Create shared object
+        let obj4 = Object::shared_for_testing();
+        objects.push(obj4.clone());
+
+        // Create test cluster with our objects
+        let test_cluster = create_test_cluster(objects).await;
+        let sui_client = SuiClient::new(&test_cluster.rpc_url(), None).await;
+
+        // Get object IDs to query
+        let object_ids = vec![obj1.id(), obj2.id(), obj3.id(), obj4.id()];
+
+        // Query owners
+        let owner_map = sui_client
+            .multi_get_object_owners(object_ids.clone())
+            .await
+            .unwrap();
+
+        // Verify results
+        assert_eq!(
+            owner_map.get(&obj1.id()),
+            Some(&(Owner::AddressOwner(owner1), obj1.version().value()))
+        );
+        assert_eq!(
+            owner_map.get(&obj2.id()),
+            Some(&(Owner::AddressOwner(owner2), obj2.version().value()))
+        );
+        assert_eq!(
+            owner_map.get(&obj3.id()),
+            Some(&(Owner::Immutable, obj3.version().value()))
+        );
+        assert_eq!(
+            owner_map.get(&obj4.id()),
+            Some(&(
+                Owner::Shared {
+                    initial_shared_version: obj4.version(),
+                },
+                obj4.version().value()
+            ))
+        );
+
+        // Verify we got all objects
+        assert_eq!(owner_map.len(), object_ids.len());
     }
 }

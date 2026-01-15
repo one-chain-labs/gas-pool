@@ -5,19 +5,20 @@ use crate::types::ReservationID;
 use fastcrypto::encoding::Base64;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sui_json_rpc_types::{SuiObjectRef, SuiTransactionBlockEffects, SuiTransactionBlockEvents};
+use sui_json_rpc_types::{
+    SuiObjectRef, SuiTransactionBlockEffects, SuiTransactionBlockResponse,
+    SuiTransactionBlockResponseOptions,
+};
 use sui_types::base_types::{ObjectRef, SuiAddress};
-use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 
 // 2 SUI.
-pub const MAX_BUDGET: u64 = 2_000_000_000;
+pub const MAX_BUDGET: u64 = 5_000_000_000;
 
 // 10 mins.
 pub const MAX_DURATION_S: u64 = 10 * 60;
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct ReserveGasRequest {
-    pub sponsor_address: Option<SuiAddress>,
     pub gas_budget: u64,
     pub reserve_duration_secs: u64,
 }
@@ -84,59 +85,38 @@ impl ReserveGasResponse {
 pub struct ExecuteTxRequest {
     pub reservation_id: ReservationID,
     pub tx_bytes: Base64,
-    pub request_type: Option<ExecuteTransactionRequestType>,
     pub user_sig: Base64,
+    pub options: Option<SuiTransactionBlockResponseOptions>,
 }
 
 #[derive(Debug, JsonSchema, Serialize, Deserialize)]
 pub struct ExecuteTxResponse {
-    pub timestamp_ms: Option<u64>,
     pub effects: Option<SuiTransactionBlockEffects>,
-    pub events: Option<SuiTransactionBlockEvents>,
+    pub tx_block_response: Option<SuiTransactionBlockResponse>,
     pub error: Option<String>,
 }
 
 impl ExecuteTxResponse {
-    pub fn new_ok(
-        timestamp_ms: Option<u64>,
-        effects: SuiTransactionBlockEffects,
-        events: Option<SuiTransactionBlockEvents>,
-    ) -> Self {
+    pub fn new_ok_effects(effects: SuiTransactionBlockEffects) -> Self {
         Self {
-            timestamp_ms,
             effects: Some(effects),
-            events,
+            tx_block_response: None,
             error: None,
         }
     }
 
-    pub fn new_err(error: anyhow::Error) -> Self {
+    pub fn new_ok_block_response(tx_block_response: SuiTransactionBlockResponse) -> Self {
         Self {
-            timestamp_ms: None,
             effects: None,
-            events: None,
-            error: Some(error.to_string()),
-        }
-    }
-}
-
-#[derive(Debug, JsonSchema, Serialize, Deserialize)]
-pub struct SupportAddressResponse {
-    pub sponsor_addresses: Option<Vec<SuiAddress>>,
-    pub error: Option<String>,
-}
-
-impl SupportAddressResponse {
-    pub fn new_ok(sponsor_addresses: Vec<SuiAddress>) -> Self {
-        Self {
-            sponsor_addresses: Some(sponsor_addresses),
+            tx_block_response: Some(tx_block_response),
             error: None,
         }
     }
 
     pub fn new_err(error: anyhow::Error) -> Self {
         Self {
-            sponsor_addresses: None,
+            effects: None,
+            tx_block_response: None,
             error: Some(error.to_string()),
         }
     }

@@ -4,16 +4,14 @@
 use crate::read_auth_env;
 use crate::rpc::rpc_types::{
     ExecuteTxRequest, ExecuteTxResponse, ReserveGasRequest, ReserveGasResponse,
-    SupportAddressResponse,
 };
 use crate::types::ReservationID;
 use anyhow::bail;
 use fastcrypto::encoding::Base64;
-use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::Client;
-use sui_json_rpc_types::SuiTransactionBlockEffects;
+use reqwest::header::{AUTHORIZATION, HeaderMap};
+use sui_json_rpc_types::SuiTransactionBlockResponseOptions;
 use sui_types::base_types::{ObjectRef, SuiAddress};
-use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 use sui_types::signature::GenericSignature;
 use sui_types::transaction::TransactionData;
 
@@ -83,12 +81,10 @@ impl GasPoolRpcClient {
 
     pub async fn reserve_gas(
         &self,
-        sponsor_address: SuiAddress,
         gas_budget: u64,
         reserve_duration_secs: u64,
     ) -> anyhow::Result<(SuiAddress, ReservationID, Vec<ObjectRef>)> {
         let request = ReserveGasRequest {
-            sponsor_address: Some(sponsor_address),
             gas_budget,
             reserve_duration_secs,
         };
@@ -109,9 +105,11 @@ impl GasPoolRpcClient {
         response
             .result
             .ok_or_else(|| {
-                anyhow::anyhow!(response
-                    .error
-                    .unwrap_or_else(|| "Unknown error".to_string()))
+                anyhow::anyhow!(
+                    response
+                        .error
+                        .unwrap_or_else(|| "Unknown error".to_string())
+                )
             })
             .map(|result| {
                 (
@@ -130,9 +128,9 @@ impl GasPoolRpcClient {
         &self,
         reservation_id: ReservationID,
         tx_data: &TransactionData,
-        request_type: Option<ExecuteTransactionRequestType>,
         user_sig: &GenericSignature,
-    ) -> anyhow::Result<SuiTransactionBlockEffects> {
+        options: Option<SuiTransactionBlockResponseOptions>,
+    ) -> anyhow::Result<ExecuteTxResponse> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -141,8 +139,8 @@ impl GasPoolRpcClient {
         let request = ExecuteTxRequest {
             reservation_id,
             tx_bytes: Base64::from_bytes(&bcs::to_bytes(&tx_data).unwrap()),
-            request_type,
             user_sig: Base64::from_bytes(user_sig.as_ref()),
+            options,
         };
         let response = self
             .client
@@ -153,33 +151,7 @@ impl GasPoolRpcClient {
             .await?
             .json::<ExecuteTxResponse>()
             .await?;
-        response.effects.ok_or_else(|| {
-            anyhow::anyhow!(response
-                .error
-                .unwrap_or_else(|| "Unknown error".to_string()))
-        })
-    }
 
-    pub async fn support_address(&self) -> anyhow::Result<Vec<SuiAddress>> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            format!("Bearer {}", read_auth_env()).parse().unwrap(),
-        );
-
-        let response = self
-            .client
-            .get(format!("{}/v1/support_address", self.server_address))
-            .headers(headers)
-            .send()
-            .await?
-            .json::<SupportAddressResponse>()
-            .await?;
-
-        response.sponsor_addresses.ok_or_else(|| {
-            anyhow::anyhow!(response
-                .error
-                .unwrap_or_else(|| "Unknown error".to_string()))
-        })
+        Ok(response)
     }
 }
